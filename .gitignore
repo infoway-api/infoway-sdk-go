@@ -1,0 +1,5 @@
+/vendor/
+*.test
+coverage.out
+.env
+.env.*
