@@ -8,6 +8,9 @@ type Financial struct {
 }
 
 func (f *Financial) get(ctx context.Context, name, symbol, typ, period string) (any, error) {
+	if !ValidSymbolType(SymbolType(typ)) {
+		return nil, OfRest(int(RestParamError), "Param error：type", "")
+	}
 	return f.http.get(ctx, "/common/basic/financial/"+name,
 		query("symbol", symbol, "type", typ, "period_type", period))
 }

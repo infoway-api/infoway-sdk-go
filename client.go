@@ -49,10 +49,13 @@ func New(opts Options) *Client {
 	}
 }
 
-// Close releases idle HTTP connections.
+// Close rejects later calls and releases idle HTTP connections.
 func (c *Client) Close() {
-	if c == nil || c.http == nil || c.http.client == nil {
+	if c == nil || c.http == nil {
 		return
 	}
-	c.http.client.CloseIdleConnections()
+	c.http.closed.Store(true)
+	if c.http.client != nil {
+		c.http.client.CloseIdleConnections()
+	}
 }
