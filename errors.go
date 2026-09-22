@@ -140,6 +140,7 @@ func (e *IOError) Unwrap() error {
 }
 
 func restFailure(ret int, msg, traceID string) error {
+	ret = ClassifyRest(ret, msg)
 	if ret == 401 {
 		return newAuthError(msg, traceID)
 	}

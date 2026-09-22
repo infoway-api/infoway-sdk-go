@@ -41,6 +41,17 @@ const (
 
 func (s SymbolType) String() string { return string(s) }
 
+// ValidSymbolType reports whether s is a type the financial and symbol APIs accept.
+func ValidSymbolType(s SymbolType) bool {
+	switch s {
+	case SymbolStockUS, SymbolStockCN, SymbolStockHK, SymbolStockJP, SymbolStockKS, SymbolStockIN, SymbolStockTW,
+		SymbolCrypto, SymbolForex, SymbolFutures, SymbolEnergy, SymbolMetal, SymbolIndices:
+		return true
+	default:
+		return false
+	}
+}
+
 // Market is an equity market code.
 type Market string
 
@@ -365,6 +376,45 @@ func WsErrorName(code int) string { return wsErrorNames[code] }
 
 // WsErrorLabel returns the WS label, or "".
 func WsErrorLabel(code int) string { return wsErrorLabels[code] }
+
+// ClassifyRest maps a wrapped ret=500 back to the business code carried in msg.
+func ClassifyRest(ret int, msg string) int {
+	if ret != int(RestServerError) || strings.TrimSpace(msg) == "" {
+		return ret
+	}
+	text := strings.ToLower(strings.TrimSpace(msg))
+	for code, label := range restErrorLabels {
+		if code == 200 || code == 400 || code == 500 {
+			continue
+		}
+		if strings.HasPrefix(text, strings.ToLower(label)) {
+			return code
+		}
+	}
+	return ret
+}
+
+// IsTerminalWs reports codes a reconnect cannot fix.
+func IsTerminalWs(code int) bool {
+	switch WsErrorCode(code) {
+	case WsErrRequestFrequencyDayExceed,
+		WsErrAPIKeyExpired,
+		WsErrAPIKeyInvalid,
+		WsErrAPIKeyEmpty,
+		WsErrAPIKeyBlacklist,
+		WsErrWSConnExceed,
+		WsErrWSURLWrong,
+		WsErrAllProductsQuantityExceed,
+		WsErrHandshakeAPIKeyMissing,
+		WsErrHandshakeAPIKeyNotExist,
+		WsErrHandshakeNoPermission,
+		WsErrProductCodeOrAlreadyConnected,
+		WsErrHandshakeMaxConnections:
+		return true
+	default:
+		return false
+	}
+}
 
 // IsWsError reports whether code is a gateway rejection (not a protocol frame).
 func IsWsError(code int) bool {

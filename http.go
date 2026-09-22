@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -21,8 +22,12 @@ const (
 )
 
 func resolveAPIKey(apiKey string) string {
-	if strings.TrimSpace(apiKey) != "" {
-		return strings.TrimSpace(apiKey)
+	trimmed := strings.TrimSpace(apiKey)
+	if apiKey != "" && trimmed == "" {
+		return ""
+	}
+	if trimmed != "" {
+		return trimmed
 	}
 	return strings.TrimSpace(os.Getenv("INFOWAY_API_KEY"))
 }
@@ -40,6 +45,7 @@ type httpClient struct {
 	baseURL    string
 	maxRetries int
 	client     *http.Client
+	closed     atomic.Bool
 }
 
 func newHTTPClient(opts Options) *httpClient {
@@ -63,7 +69,17 @@ func newHTTPClient(opts Options) *httpClient {
 	}
 }
 
+func (c *httpClient) ensureOpen() error {
+	if c.closed.Load() {
+		return &IOError{Msg: "InfowayClient is closed"}
+	}
+	return nil
+}
+
 func (c *httpClient) get(ctx context.Context, path string, params url.Values) (any, error) {
+	if err := c.ensureOpen(); err != nil {
+		return nil, err
+	}
 	u := c.baseURL + path
 	if len(params) > 0 {
 		u += "?" + params.Encode()
@@ -76,6 +92,9 @@ func (c *httpClient) get(ctx context.Context, path string, params url.Values) (a
 }
 
 func (c *httpClient) post(ctx context.Context, path string, body any) (any, error) {
+	if err := c.ensureOpen(); err != nil {
+		return nil, err
+	}
 	raw, err := json.Marshal(body)
 	if err != nil {
 		return nil, err

@@ -262,6 +262,9 @@ func (w *WebSocket) dispatch(raw []byte) {
 			trace = strField(msg, "trace")
 		}
 		w.emitError(wsFailure(code, strField(msg, "msg"), trace))
+		if IsTerminalWs(code) {
+			w.stopForTerminal()
+		}
 		return
 	}
 	data, _ := msg["data"].(map[string]any)
@@ -354,6 +357,17 @@ func (w *WebSocket) UnsubscribeKline(codes string, klineType KlineType) {
 		"trace": traceID(),
 		"data":  map[string]any{"codes": codes, "klineTypes": fmt.Sprintf("%d", klineType)},
 	})
+}
+
+func (w *WebSocket) stopForTerminal() {
+	w.mu.Lock()
+	w.running = false
+	conn := w.conn
+	w.conn = nil
+	w.mu.Unlock()
+	if conn != nil {
+		_ = conn.Close()
+	}
 }
 
 // Close stops reconnect and closes the socket.

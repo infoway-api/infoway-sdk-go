@@ -247,6 +247,9 @@ func (n *NewsWebSocket) dispatch(raw []byte) {
 			trace = strField(msg, "trace")
 		}
 		n.emitError(wsFailure(code, strField(msg, "msg"), trace))
+		if IsTerminalWs(code) {
+			n.stopForTerminal()
+		}
 		return
 	}
 	if WsCode(code) == WsPushNews {
@@ -297,6 +300,17 @@ func (n *NewsWebSocket) Unsubscribe() {
 	n.lang = ""
 	if n.conn != nil {
 		_ = n.conn.WriteJSON(map[string]any{"code": int(WsUnsubNews), "trace": traceID()})
+	}
+}
+
+func (n *NewsWebSocket) stopForTerminal() {
+	n.mu.Lock()
+	n.running = false
+	conn := n.conn
+	n.conn = nil
+	n.mu.Unlock()
+	if conn != nil {
+		_ = conn.Close()
 	}
 }
 
