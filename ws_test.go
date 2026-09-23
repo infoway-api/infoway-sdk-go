@@ -316,3 +316,174 @@ func TestNews401(t *testing.T) {
 		t.Fatalf("%v", err)
 	}
 }
+
+func TestParseWSFrameStripsSubscribeFail(t *testing.T) {
+	msg, ok := parseWSFrame([]byte(`Subscribe fail: {"code":516,"msg":"All WS subscribe exceeds the limit 6000","traceId":"t"}`))
+	if !ok || int(msg["code"].(float64)) != 516 {
+		t.Fatalf("%v %v", ok, msg)
+	}
+	if _, ok := parseWSFrame([]byte("You have permission to subscribe to all market data")); ok {
+		t.Fatal("plain text must be ignored")
+	}
+	prose, proseOK := subscribeFailProse([]byte("Subscribe fail: no permission for this market"))
+	if !proseOK || prose != "no permission for this market" {
+		t.Fatalf("prose = %q ok=%v", prose, proseOK)
+	}
+	if _, ok := subscribeFailProse([]byte("You have permission to subscribe to all market data")); ok {
+		t.Fatal("greeting is not a subscribe failure")
+	}
+	if watchdogResendGap(10, 8*time.Second) != 8*time.Second {
+		t.Fatal("small sets keep the ack timeout")
+	}
+	if watchdogResendGap(15, 8*time.Second) != 60*time.Second {
+		t.Fatal("15 groups must not replay every 15s")
+	}
+	sent := make([]time.Time, 50)
+	now := time.Now()
+	for i := range sent {
+		sent[i] = now
+	}
+	if quotaRetryDelay(2*time.Second, 20, sent, now, 60, time.Minute) < time.Minute {
+		t.Fatal("20 groups on top of 50 recent frames must wait out the minute")
+	}
+	if quotaRetryRemaining(10, sent, now, 60, time.Minute) < time.Minute {
+		t.Fatal("frames sent during the backoff must push the retry out")
+	}
+	if quotaRetryRemaining(60, sent, now, 60, time.Minute) != 0 {
+		t.Fatal("a replay larger than the room must not wait another window")
+	}
+	if quotaRetryRemaining(1, nil, now, 60, time.Minute) != 0 {
+		t.Fatal("an empty window must send now")
+	}
+	edge := make([]time.Time, 40)
+	for i := 0; i < 20; i++ {
+		edge[i] = now.Add(-time.Minute)
+		edge[i+20] = now.Add(-58 * time.Second)
+	}
+	if got := quotaRetryRemaining(20, edge, now, 60, time.Minute); got != time.Millisecond {
+		t.Fatalf("exact window edge must step 1ms past, got %s", got)
+	}
+	wStamps := &WebSocket{}
+	for i := 0; i < 300; i++ {
+		wStamps.noteOutboundLocked(now)
+	}
+	if len(wStamps.outbound) != outboundStampLimit {
+		t.Fatalf("outbound stamps = %d", len(wStamps.outbound))
+	}
+	w := &WebSocket{pendingAcks: 15, lastSubscribe: time.Now().Add(-2 * time.Minute)}
+	w.dispatch([]byte("Subscribe fail: product is not stock"))
+	if w.pendingAcks != 0 {
+		t.Fatalf("prose rejection left pendingAcks=%d", w.pendingAcks)
+	}
+	w505 := &WebSocket{pendingAcks: 10, lastSubscribe: time.Now().Add(-2 * time.Minute)}
+	w505.dispatch([]byte(`Subscribe fail: {"code":505,"msg":"Single WS subscribe exceeds the limit 600","traceId":"t"}`))
+	if w505.pendingAcks != 0 {
+		t.Fatalf("505 left pendingAcks=%d", w505.pendingAcks)
+	}
+	if IsTerminalWs(516) {
+		t.Fatal("516 must not be terminal")
+	}
+	if !IsSubscribeQuotaExceeded(516) {
+		t.Fatal("516")
+	}
+}
+
+func TestWS516RetriesSubscribe(t *testing.T) {
+	got := make(chan map[string]any, 8)
+	var conn *websocket.Conn
+	ready := make(chan struct{}, 1)
+	srv := startWS(t, func(c *websocket.Conn) {
+		conn = c
+		ready <- struct{}{}
+	}, func(raw []byte) {
+		var m map[string]any
+		_ = json.Unmarshal(raw, &m)
+		got <- m
+	})
+	ws, err := NewWebSocket(WSOptions{
+		APIKey: "k", Business: BusinessCrypto,
+		BaseURL:              "ws" + strings.TrimPrefix(srv.URL, "http"),
+		MaxReconnectAttempts: 1,
+		SubscribeRetry:       40 * time.Millisecond,
+		StaleAfter:           time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	errs := make(chan error, 1)
+	ws.OnError = func(e error) { errs <- e }
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = ws.Connect(ctx) }()
+	<-ready
+	ws.SubscribeTrade("BTCUSDT", false)
+	if !waitCode(t, got, 10000) {
+		t.Fatal("first subscribe")
+	}
+	_ = conn.WriteMessage(websocket.TextMessage, []byte(`Subscribe fail: {"code":516,"msg":"All WS subscribe exceeds the limit 6000","traceId":"t"}`))
+	select {
+	case e := <-errs:
+		api, ok := e.(*APIError)
+		if !ok || api.Ret != 516 {
+			t.Fatalf("%v", e)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("516 not reported")
+	}
+	if !waitCode(t, got, 10000) {
+		t.Fatal("516 must resubscribe")
+	}
+	_ = ws.Close()
+}
+
+func TestWSStaleWatchdogResubscribes(t *testing.T) {
+	got := make(chan map[string]any, 8)
+	var conn *websocket.Conn
+	ready := make(chan struct{}, 1)
+	srv := startWS(t, func(c *websocket.Conn) {
+		conn = c
+		ready <- struct{}{}
+	}, func(raw []byte) {
+		var m map[string]any
+		_ = json.Unmarshal(raw, &m)
+		got <- m
+	})
+	ws, err := NewWebSocket(WSOptions{
+		APIKey: "k", Business: BusinessCrypto,
+		BaseURL:              "ws" + strings.TrimPrefix(srv.URL, "http"),
+		MaxReconnectAttempts: 1,
+		StaleAfter:           80 * time.Millisecond,
+		SubscribeRetry:       time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = ws.Connect(ctx) }()
+	<-ready
+	ws.SubscribeTrade("BTCUSDT", false)
+	if !waitCode(t, got, 10000) {
+		t.Fatal("first subscribe")
+	}
+	_ = conn.WriteJSON(map[string]any{"code": 10002, "data": map[string]any{"s": "BTCUSDT", "p": "1"}})
+	if !waitCode(t, got, 10000) {
+		t.Fatal("stale watchdog must resubscribe")
+	}
+	_ = ws.Close()
+}
+
+func waitCode(t *testing.T, ch <-chan map[string]any, want int) bool {
+	t.Helper()
+	deadline := time.After(3 * time.Second)
+	for {
+		select {
+		case m := <-ch:
+			if code, ok := m["code"].(float64); ok && int(code) == want {
+				return true
+			}
+		case <-deadline:
+			return false
+		}
+	}
+}

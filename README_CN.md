@@ -10,7 +10,7 @@ Infoway 官方 Go SDK。覆盖 REST 行情、基础信息、市场概览、板�
 
 | 项目 | 说明 |
 | --- | --- |
-| 模块 | [`github.com/infoway-api/infoway-sdk-go@v0.4.0`](https://pkg.go.dev/github.com/infoway-api/infoway-sdk-go) |
+| 模块 | [`github.com/infoway-api/infoway-sdk-go@v0.4.1`](https://pkg.go.dev/github.com/infoway-api/infoway-sdk-go) |
 | 运行环境 | Go 1.22+ |
 | REST | `https://data.infoway.io` |
 | 行情 WebSocket | `wss://data.infoway.io/ws` |
@@ -36,7 +36,7 @@ Infoway 官方 Go SDK。覆盖 REST 行情、基础信息、市场概览、板�
 ## 安装
 
 ```bash
-go get github.com/infoway-api/infoway-sdk-go@v0.4.0
+go get github.com/infoway-api/infoway-sdk-go@v0.4.1
 ```
 
 ## 快速开始
@@ -187,7 +187,7 @@ REST 解成 `any`（`[]any` 或 `map[string]any`）。数字为 `float64`，价�
 
 ### 行情
 
-`Business` 必须与标的市场一致。`Connect` 会阻塞，请在 goroutine 中调用。单连接每分钟最多 60 帧，见 [WebSocket限制](https://docs.infoway.io/getting-started/api-limitation/websocket)。
+`Business` 必须与标的市场一致。`Connect` 会阻塞，请在 goroutine 中调用。单连接每分钟最多 60 帧，见 [WebSocket限制](https://docs.infoway.io/getting-started/api-limitation/websocket)。`Subscribe fail` / `516` 会走 `OnError` 并在同一条连接上重订；重连前先发 close 帧；本连接收过行情后约 90 秒没有新 tick 会自动重订（`StaleAfter` 可调）。
 
 ```go
 ws, err := infoway.NewWebSocket(infoway.WSOptions{

@@ -10,7 +10,7 @@ Official Infoway Go SDK for REST market data, fundamentals, and WebSocket stream
 
 | Item | Description |
 | --- | --- |
-| Module | [`github.com/infoway-api/infoway-sdk-go@v0.4.0`](https://pkg.go.dev/github.com/infoway-api/infoway-sdk-go) |
+| Module | [`github.com/infoway-api/infoway-sdk-go@v0.4.1`](https://pkg.go.dev/github.com/infoway-api/infoway-sdk-go) |
 | Runtime | Go 1.22+ |
 | REST | `https://data.infoway.io` |
 | Quotes WebSocket | `wss://data.infoway.io/ws` |
@@ -36,7 +36,7 @@ If `APIKey` is omitted, the SDK reads `INFOWAY_API_KEY`. REST methods take `cont
 ## Install
 
 ```bash
-go get github.com/infoway-api/infoway-sdk-go@v0.4.0
+go get github.com/infoway-api/infoway-sdk-go@v0.4.1
 ```
 
 ## Quick start
@@ -187,7 +187,7 @@ REST methods decode JSON into `any` (`[]any` or `map[string]any`). Numbers are `
 
 ### Quotes
 
-`Business` must match the symbol market. `Connect` blocks — run it in a goroutine. 60 frames per minute per connection. See [WebSocket Limitation](https://docs.infoway.io/en-docs/getting-started/api-limitation/websocket-limitation).
+`Business` must match the symbol market. `Connect` blocks — run it in a goroutine. 60 frames per minute per connection. See [WebSocket Limitation](https://docs.infoway.io/en-docs/getting-started/api-limitation/websocket-limitation). `Subscribe fail` / `516` go to `OnError` and the same socket resubscribes; the previous socket is closed before reconnect; after this socket has seen ticks, about 90s of silence triggers another subscribe (`StaleAfter` is configurable).
 
 ```go
 ws, err := infoway.NewWebSocket(infoway.WSOptions{

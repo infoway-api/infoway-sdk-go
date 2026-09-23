@@ -3,7 +3,7 @@ package infoway
 import "testing"
 
 func TestVersion(t *testing.T) {
-	if Version != "0.4.0" {
+	if Version != "0.4.1" {
 		t.Fatalf("Version=%s", Version)
 	}
 }

@@ -15,8 +15,8 @@ type Client struct {
 	http      *httpClient
 	Stock     *MarketData
 	Crypto    *MarketData
-	Japan     *MarketData
-	India     *MarketData
+	Japan     *MarketData // Tokyo: 7203.JP. Yahoo 7203.T returns 508.
+	India     *MarketData // India: RELIANCE.IN. Yahoo RELIANCE.NS returns 508.
 	Korea     *MarketData
 	Taiwan    *MarketData
 	Common    *MarketData

@@ -49,7 +49,9 @@ type MarketData struct {
 	prefix string
 }
 
-// GetTrade returns real-time trades for comma-separated codes.
+// GetTrade returns real-time trades for comma-separated codes such as
+// AAPL.US, 00700.HK, 7203.JP and RELIANCE.IN.
+// Japan is .JP, not Yahoo .T. India is .IN, not Yahoo .NS. Those return 508.
 func (m *MarketData) GetTrade(ctx context.Context, codes string) (any, error) {
 	if err := checkSymbols(codes); err != nil {
 		return nil, err

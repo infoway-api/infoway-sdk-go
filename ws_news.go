@@ -2,7 +2,6 @@ package infoway
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -230,8 +229,13 @@ func (n *NewsWebSocket) dispatch(raw []byte) {
 	if n.OnFrame != nil {
 		func() { defer func() { _ = recover() }(); n.OnFrame(string(raw)) }()
 	}
-	var msg map[string]any
-	if err := json.Unmarshal(raw, &msg); err != nil {
+	msg, ok := parseWSFrame(raw)
+	if !ok {
+		return
+	}
+	if prose, isProse := msg["subscribeFailProse"].(bool); isProse && prose {
+		text, _ := msg["msg"].(string)
+		n.emitError(&APIError{Ret: 0, Msg: text, ErrorName: "SUBSCRIBE_FAIL"})
 		return
 	}
 	code, ok := asInt(msg["code"])

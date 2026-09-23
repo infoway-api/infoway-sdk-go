@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -15,10 +17,20 @@ import (
 )
 
 const (
-	defaultWSURL      = "wss://data.infoway.io/ws"
-	heartbeatInterval = 30 * time.Second
-	initialBackoff    = time.Second
-	maxWSBackoff      = 30 * time.Second
+	defaultWSURL            = "wss://data.infoway.io/ws"
+	heartbeatInterval       = 30 * time.Second
+	initialBackoff          = time.Second
+	maxWSBackoff            = 30 * time.Second
+	defaultStaleAfter       = 90 * time.Second
+	defaultSubscribeRetry   = 2 * time.Second
+	defaultAckTimeout       = 8 * time.Second
+	subscribeFailPrefix     = "Subscribe fail:"
+	frameBudget             = 60
+	// Two heartbeats per minute, plus room for subscribe/unsubscribe frames.
+	heartbeatReserve        = 8
+	outboundStampLimit      = 256
+	// A frame aged exactly one window is still on the closed edge. Step past it.
+	windowSlack             = time.Millisecond
 )
 
 // WSOptions configures a quotes WebSocket.
@@ -30,6 +42,11 @@ type WSOptions struct {
 	PrintFrames          bool
 	HeartbeatInterval    time.Duration
 	ReconnectBackoff     time.Duration
+	// StaleAfter resubscribes when this socket has seen ticks then gone silent.
+	// Default 90s. 0 disables the watchdog.
+	StaleAfter time.Duration
+	// SubscribeRetry is the first delay after a 516. Default 2s.
+	SubscribeRetry time.Duration
 }
 
 type subscription struct {
@@ -44,9 +61,12 @@ type WebSocket struct {
 	url          string
 	maxReconnect int
 	printFrames  bool
-	hbInterval   time.Duration
-	initBackoff  time.Duration
-	hbGens       int
+	hbInterval      time.Duration
+	initBackoff     time.Duration
+	staleAfter      time.Duration
+	subscribeRetry  time.Duration
+	ackTimeout      time.Duration
+	hbGens          int
 	OnTrade      func(map[string]any)
 	OnDepth      func(map[string]any)
 	OnKline      func(map[string]any)
@@ -55,12 +75,21 @@ type WebSocket struct {
 	OnReconnect  func()
 	OnDisconnect func()
 
-	mu        sync.Mutex
-	subs      map[string]subscription
-	conn      *websocket.Conn
-	stop      chan struct{}
-	running   bool
-	connected bool
+	mu                   sync.Mutex
+	subs                 map[string]subscription
+	conn                 *websocket.Conn
+	stop                 chan struct{}
+	running              bool
+	connected            bool
+	hadPush              bool
+	lastPush             time.Time
+	lastSubscribe        time.Time
+	lastResub            time.Time
+	pendingAcks          int
+	outbound             []time.Time
+	staleRetries         int
+	subscribeFailRetries int
+	retryTimer           *time.Timer
 }
 
 // NewWebSocket requires APIKey (or INFOWAY_API_KEY) and Business.
@@ -84,13 +113,24 @@ func NewWebSocket(opts WSOptions) (*WebSocket, error) {
 	if bo <= 0 {
 		bo = initialBackoff
 	}
+	stale := defaultStaleAfter
+	if opts.StaleAfter > 0 {
+		stale = opts.StaleAfter
+	}
+	retry := defaultSubscribeRetry
+	if opts.SubscribeRetry > 0 {
+		retry = opts.SubscribeRetry
+	}
 	return &WebSocket{
-		url:          fmt.Sprintf("%s?business=%s&apikey=%s", base, opts.Business, key),
-		maxReconnect: opts.MaxReconnectAttempts,
-		printFrames:  opts.PrintFrames,
-		hbInterval:   hb,
-		initBackoff:  bo,
-		subs:         map[string]subscription{},
+		url:            fmt.Sprintf("%s?business=%s&apikey=%s", base, opts.Business, key),
+		maxReconnect:   opts.MaxReconnectAttempts,
+		printFrames:    opts.PrintFrames,
+		hbInterval:     hb,
+		initBackoff:    bo,
+		staleAfter:     stale,
+		subscribeRetry: retry,
+		ackTimeout:     defaultAckTimeout,
+		subs:           map[string]subscription{},
 	}, nil
 }
 
@@ -165,6 +205,19 @@ func (w *WebSocket) Connect(ctx context.Context) error {
 }
 
 func (w *WebSocket) connectOnce(ctx context.Context) (opened bool, err error) {
+	w.mu.Lock()
+	leftover := w.conn
+	w.conn = nil
+	w.hadPush = false
+	w.lastPush = time.Time{}
+	w.pendingAcks = 0
+	w.stopRetryLocked()
+	w.mu.Unlock()
+	if leftover != nil {
+		_ = leftover.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "reconnect"), time.Now().Add(2*time.Second))
+		_ = leftover.Close()
+	}
+
 	dialer := websocket.Dialer{
 		HandshakeTimeout: 15 * time.Second,
 		ReadBufferSize:   16 * 1024,
@@ -185,7 +238,7 @@ func (w *WebSocket) connectOnce(ctx context.Context) (opened bool, err error) {
 	reconnected := w.connected
 	w.conn = conn
 	w.connected = true
-	w.resubscribeLocked()
+	w.resubscribeLocked(true)
 	w.mu.Unlock()
 	if reconnected {
 		w.safeRun(w.OnReconnect)
@@ -195,6 +248,7 @@ func (w *WebSocket) connectOnce(ctx context.Context) (opened bool, err error) {
 	defer cancel()
 	w.hbGens++
 	go w.heartbeat(hbCtx, conn)
+	go w.watchdog(hbCtx, conn)
 
 	for {
 		_, raw, err := conn.ReadMessage()
@@ -203,8 +257,11 @@ func (w *WebSocket) connectOnce(ctx context.Context) (opened bool, err error) {
 			if w.conn == conn {
 				w.conn = nil
 			}
+			w.stopRetryLocked()
 			w.mu.Unlock()
 			cancel()
+			_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "reconnect"), time.Now().Add(time.Second))
+			_ = conn.Close()
 			return true, err
 		}
 		w.dispatch(raw)
@@ -238,6 +295,134 @@ func (w *WebSocket) heartbeat(ctx context.Context, conn *websocket.Conn) {
 	}
 }
 
+func parseWSFrame(raw []byte) (map[string]any, bool) {
+	body := strings.TrimSpace(string(raw))
+	if strings.HasPrefix(body, subscribeFailPrefix) {
+		rest := strings.TrimSpace(body[len(subscribeFailPrefix):])
+		if rest != "" && !strings.Contains(rest, "{") {
+			return map[string]any{"msg": rest, "subscribeFailProse": true}, true
+		}
+		body = rest
+	}
+	if i := strings.IndexByte(body, '{'); i > 0 {
+		body = body[i:]
+	}
+	if body == "" || body[0] != '{' {
+		return nil, false
+	}
+	var msg map[string]any
+	if err := json.Unmarshal([]byte(body), &msg); err != nil {
+		return nil, false
+	}
+	return msg, true
+}
+
+// subscribeFailProse is the text after "Subscribe fail:" when the server sent no JSON.
+func subscribeFailProse(raw []byte) (string, bool) {
+	body := strings.TrimSpace(string(raw))
+	if !strings.HasPrefix(body, subscribeFailPrefix) {
+		return "", false
+	}
+	rest := strings.TrimSpace(body[len(subscribeFailPrefix):])
+	if rest == "" || strings.Contains(rest, "{") {
+		return "", false
+	}
+	return rest, true
+}
+
+// quotaRetryDelay is how long a 516 resubscribe waits. The server counts every
+// inbound frame, including heartbeats, toward 60 per minute. heartbeatReserve
+// frames stay unused so heartbeats and a few application frames still fit.
+func quotaRetryDelay(backoff time.Duration, groups int, sent []time.Time, now time.Time, budget int, window time.Duration) time.Duration {
+	n := groups
+	if n < 1 {
+		n = 1
+	}
+	room := budget - heartbeatReserve
+	recent := make([]time.Time, 0, len(sent))
+	for _, t := range sent {
+		if now.Sub(t) < window {
+			recent = append(recent, t)
+		}
+	}
+	sort.Slice(recent, func(i, j int) bool { return recent[i].Before(recent[j]) })
+	if n > room {
+		if backoff > window {
+			return backoff
+		}
+		return window
+	}
+	free := room - len(recent)
+	if free >= n {
+		return backoff
+	}
+	need := n - free
+	if need > len(recent) {
+		if backoff > window {
+			return backoff
+		}
+		return window
+	}
+	expire := window - now.Sub(recent[need-1])
+	if backoff > expire {
+		return backoff
+	}
+	return expire
+}
+
+// quotaRetryRemaining is the extra wait when a scheduled 516 retry comes due.
+// The backoff was already slept. Returns 0 when the replay fits, and when it
+// can never fit in one window. A frame aged exactly one window is still inside
+// a closed window, so a positive result is one millisecond past that edge.
+func quotaRetryRemaining(groups int, sent []time.Time, now time.Time, budget int, window time.Duration) time.Duration {
+	n := groups
+	if n < 1 {
+		n = 1
+	}
+	room := budget - heartbeatReserve
+	if n > room {
+		return 0
+	}
+	recent := make([]time.Time, 0, len(sent))
+	for _, t := range sent {
+		if now.Sub(t) <= window {
+			recent = append(recent, t)
+		}
+	}
+	sort.Slice(recent, func(i, j int) bool { return recent[i].Before(recent[j]) })
+	free := room - len(recent)
+	if free >= n {
+		return 0
+	}
+	need := n - free
+	if need > len(recent) {
+		return 0
+	}
+	expire := window - now.Sub(recent[need-1])
+	if expire < 0 {
+		expire = 0
+	}
+	return expire + windowSlack
+}
+
+// watchdogResendGap is how long to wait before replaying unacked subscriptions.
+// Ten groups or fewer keep ackTimeout. A larger set, replayed on every 15s poll,
+// would use up the 60 frames/minute budget by itself.
+func watchdogResendGap(groups int, ackTimeout time.Duration) time.Duration {
+	n := groups
+	if n < 1 {
+		n = 1
+	}
+	if n <= 10 {
+		return ackTimeout
+	}
+	gap := 60 * time.Second * time.Duration(n) / 40
+	if gap < 60*time.Second {
+		return 60 * time.Second
+	}
+	return gap
+}
+
 func (w *WebSocket) dispatch(raw []byte) {
 	if w.printFrames {
 		log.Print(string(raw))
@@ -245,9 +430,21 @@ func (w *WebSocket) dispatch(raw []byte) {
 	if w.OnFrame != nil {
 		w.safeCallStr(w.OnFrame, string(raw))
 	}
-	var msg map[string]any
-	if err := json.Unmarshal(raw, &msg); err != nil {
-		return // stock welcome is plain text
+	msg, ok := parseWSFrame(raw)
+	if !ok {
+		return
+	}
+	if prose, isProse := msg["subscribeFailProse"].(bool); isProse && prose {
+		w.mu.Lock()
+		w.pendingAcks = 0
+		if w.retryTimer != nil {
+			w.retryTimer.Stop()
+			w.retryTimer = nil
+		}
+		w.mu.Unlock()
+		text, _ := msg["msg"].(string)
+		w.emitError(&APIError{Ret: 0, Msg: text, ErrorName: "SUBSCRIBE_FAIL"})
+		return
 	}
 	code, ok := asInt(msg["code"])
 	if !ok {
@@ -264,27 +461,169 @@ func (w *WebSocket) dispatch(raw []byte) {
 		w.emitError(wsFailure(code, strField(msg, "msg"), trace))
 		if IsTerminalWs(code) {
 			w.stopForTerminal()
+			return
+		}
+		if IsSubscribeQuotaExceeded(code) {
+			w.mu.Lock()
+			w.scheduleSubscribeRetryLocked()
+			w.mu.Unlock()
+		} else if code == int(WsErrProductsQuantityExceed) {
+			w.mu.Lock()
+			w.pendingAcks = 0
+			if w.retryTimer != nil {
+				w.retryTimer.Stop()
+				w.retryTimer = nil
+			}
+			w.mu.Unlock()
 		}
 		return
 	}
 	data, _ := msg["data"].(map[string]any)
 	switch WsCode(code) {
 	case WsPushTrade:
+		w.notePush()
 		if data != nil && w.OnTrade != nil {
 			w.safeCall(w.OnTrade, data)
 		}
 	case WsPushDepth:
+		w.notePush()
 		if data != nil && w.OnDepth != nil {
 			w.safeCall(w.OnDepth, data)
 		}
 	case WsPushKline:
+		w.notePush()
 		if data != nil && w.OnKline != nil {
 			w.safeCall(w.OnKline, data)
+		}
+	case WsSubTradeAck, WsSubDepthAck, WsSubKlineAck:
+		w.noteSubscribeAck()
+	}
+}
+
+func (w *WebSocket) notePush() {
+	w.mu.Lock()
+	w.lastPush = time.Now()
+	w.hadPush = true
+	w.staleRetries = 0
+	w.subscribeFailRetries = 0
+	w.mu.Unlock()
+}
+
+func (w *WebSocket) noteSubscribeAck() {
+	w.mu.Lock()
+	if w.pendingAcks > 0 {
+		w.pendingAcks--
+	}
+	w.subscribeFailRetries = 0
+	w.mu.Unlock()
+}
+
+func (w *WebSocket) noteSubscribeSentLocked() {
+	w.pendingAcks++
+	w.lastSubscribe = time.Now()
+}
+
+func (w *WebSocket) stopRetryLocked() {
+	if w.retryTimer != nil {
+		w.retryTimer.Stop()
+		w.retryTimer = nil
+	}
+}
+
+func (w *WebSocket) scheduleSubscribeRetryLocked() {
+	if len(w.subs) == 0 || w.retryTimer != nil {
+		return
+	}
+	w.pendingAcks = 0
+	shift := w.subscribeFailRetries
+	if shift > 4 {
+		shift = 4
+	}
+	backoff := w.subscribeRetry * time.Duration(1<<shift)
+	if backoff > maxWSBackoff {
+		backoff = maxWSBackoff
+	}
+	delay := quotaRetryDelay(backoff, len(w.subs), w.outbound, time.Now(), frameBudget, time.Minute)
+	w.subscribeFailRetries++
+	w.armSubscribeRetryLocked(delay, true)
+}
+
+// recheck is true only for the first wake, so a replay that can never fit does not loop.
+func (w *WebSocket) armSubscribeRetryLocked(delay time.Duration, recheck bool) {
+	w.retryTimer = time.AfterFunc(delay, func() {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		w.retryTimer = nil
+		if !w.running || w.conn == nil || len(w.subs) == 0 {
+			return
+		}
+		if recheck {
+			extra := quotaRetryRemaining(len(w.subs), w.outbound, time.Now(), frameBudget, time.Minute)
+			if extra > 0 {
+				w.armSubscribeRetryLocked(extra, false)
+				return
+			}
+		}
+		w.resubscribeLocked(false)
+	})
+}
+
+func (w *WebSocket) watchdog(ctx context.Context, conn *websocket.Conn) {
+	if w.staleAfter <= 0 {
+		return
+	}
+	tick := w.staleAfter / 3
+	if tick < 20*time.Millisecond {
+		tick = 20 * time.Millisecond
+	}
+	if tick > 15*time.Second {
+		tick = 15 * time.Second
+	}
+	t := time.NewTicker(tick)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			w.mu.Lock()
+			if w.conn != conn || len(w.subs) == 0 {
+				w.mu.Unlock()
+				continue
+			}
+			now := time.Now()
+			ackGap := watchdogResendGap(len(w.subs), w.ackTimeout)
+			if w.pendingAcks > 0 && !w.lastSubscribe.IsZero() && now.Sub(w.lastSubscribe) >= ackGap {
+				w.resubscribeLocked(true)
+				w.mu.Unlock()
+				continue
+			}
+			if !w.hadPush || w.lastPush.IsZero() || now.Sub(w.lastPush) < w.staleAfter {
+				w.mu.Unlock()
+				continue
+			}
+			shift := w.staleRetries
+			if shift > 3 {
+				shift = 3
+			}
+			cooldown := w.staleAfter * time.Duration(1<<shift)
+			if cooldown > 5*time.Minute {
+				cooldown = 5 * time.Minute
+			}
+			if w.staleRetries > 0 && !w.lastResub.IsZero() && now.Sub(w.lastResub) < cooldown {
+				w.mu.Unlock()
+				continue
+			}
+			w.staleRetries++
+			w.lastResub = now
+			w.resubscribeLocked(true)
+			w.mu.Unlock()
 		}
 	}
 }
 
-func (w *WebSocket) resubscribeLocked() {
+func (w *WebSocket) resubscribeLocked(trackAcks bool) {
+	w.pendingAcks = 0
 	for _, sub := range w.subs {
 		switch sub.kind {
 		case "trade":
@@ -294,6 +633,12 @@ func (w *WebSocket) resubscribeLocked() {
 		case "kline":
 			w.sendLocked(klineMessage(int(WsSubKline), sub.codes, sub.klineType))
 		}
+		if trackAcks {
+			w.noteSubscribeSentLocked()
+		}
+	}
+	if !trackAcks {
+		w.pendingAcks = 0
 	}
 }
 
@@ -307,8 +652,17 @@ func (w *WebSocket) sendLocked(payload any) error {
 		c := w.conn
 		w.conn = nil
 		go func() { _ = c.Close() }()
+		return err
 	}
-	return err
+	w.noteOutboundLocked(time.Now())
+	return nil
+}
+
+func (w *WebSocket) noteOutboundLocked(at time.Time) {
+	w.outbound = append(w.outbound, at)
+	if over := len(w.outbound) - outboundStampLimit; over > 0 {
+		w.outbound = w.outbound[over:]
+	}
 }
 
 // SubscribeTrade records codes and sends 10000 when the socket is open.
@@ -317,6 +671,7 @@ func (w *WebSocket) SubscribeTrade(codes string, includeTy bool) {
 	defer w.mu.Unlock()
 	w.subs["trade|"+codes] = subscription{kind: "trade", codes: codes, includeTy: includeTy}
 	w.sendLocked(codesMessage(int(WsSubTrade), codes, includeTy))
+	w.noteSubscribeSentLocked()
 }
 
 func (w *WebSocket) SubscribeDepth(codes string) {
@@ -324,6 +679,7 @@ func (w *WebSocket) SubscribeDepth(codes string) {
 	defer w.mu.Unlock()
 	w.subs["depth|"+codes] = subscription{kind: "depth", codes: codes}
 	w.sendLocked(codesMessage(int(WsSubDepth), codes, false))
+	w.noteSubscribeSentLocked()
 }
 
 func (w *WebSocket) SubscribeKline(codes string, klineType KlineType) {
@@ -332,6 +688,7 @@ func (w *WebSocket) SubscribeKline(codes string, klineType KlineType) {
 	key := fmt.Sprintf("kline|%s|%d", codes, klineType)
 	w.subs[key] = subscription{kind: "kline", codes: codes, klineType: int(klineType)}
 	w.sendLocked(klineMessage(int(WsSubKline), codes, int(klineType)))
+	w.noteSubscribeSentLocked()
 }
 
 func (w *WebSocket) UnsubscribeTrade(codes string) {
@@ -383,7 +740,9 @@ func (w *WebSocket) Close() error {
 		}
 		w.stop = nil
 	}
+	w.stopRetryLocked()
 	if w.conn != nil {
+		_ = w.conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "client close"), time.Now().Add(time.Second))
 		err := w.conn.Close()
 		w.conn = nil
 		return err

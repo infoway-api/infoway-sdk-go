@@ -394,7 +394,13 @@ func ClassifyRest(ret int, msg string) int {
 	return ret
 }
 
-// IsTerminalWs reports codes a reconnect cannot fix.
+// IsSubscribeQuotaExceeded is WS 516. Old sockets may still hold quota after
+// they stop heartbeating; retry subscribe on the same connection.
+func IsSubscribeQuotaExceeded(code int) bool {
+	return code == int(WsErrAllProductsQuantityExceed)
+}
+
+// IsTerminalWs reports codes a reconnect cannot fix. 516 is recoverable.
 func IsTerminalWs(code int) bool {
 	switch WsErrorCode(code) {
 	case WsErrRequestFrequencyDayExceed,
@@ -404,7 +410,6 @@ func IsTerminalWs(code int) bool {
 		WsErrAPIKeyBlacklist,
 		WsErrWSConnExceed,
 		WsErrWSURLWrong,
-		WsErrAllProductsQuantityExceed,
 		WsErrHandshakeAPIKeyMissing,
 		WsErrHandshakeAPIKeyNotExist,
 		WsErrHandshakeNoPermission,
